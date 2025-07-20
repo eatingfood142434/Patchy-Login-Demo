@@ -1,90 +1,104 @@
+require('dotenv').config();
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
-const bodyParser = require('body-parser');
-const path = require('path');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const mysql = require('mysql2/promise');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
 const app = express();
-const port = 3001;
+app.use(helmet());
+app.use(express.json());
 
-// Middleware
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json());
-app.use(express.static('public'));
+// Basic rate limiter to prevent brute-force attacks
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,                 // limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later.'
+});
+app.use(limiter);
 
-// Initialize SQLite database
-const db = new sqlite3.Database(':memory:');
-
-// Create users table and insert sample data
-db.serialize(() => {
-    db.run(`CREATE TABLE users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT,
-        password TEXT
-    )`);
-    
-    // Insert sample users
-    db.run("INSERT INTO users (username, password) VALUES ('admin', 'secretpassword')");
-    db.run("INSERT INTO users (username, password) VALUES ('user1', 'password123')");
-    db.run("INSERT INTO users (username, password) VALUES ('testuser', 'mypassword')");
+// Create a connection pool using environment variables
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
 });
 
-// Serve the login page
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// VULNERABLE LOGIN ENDPOINT - DO NOT USE IN PRODUCTION!
-app.post('/login', (req, res) => {
+// Registration endpoint – hashes password before storing
+app.post('/register', async (req, res) => {
+  try {
     const { username, password } = req.body;
-    
-    // VULNERABLE SQL QUERY - Directly interpolating user input!
-    const query = `SELECT * FROM users WHERE username = '${username}' AND password = '${password}'`;
-    
-    console.log('Executing query:', query); // For demonstration purposes
-    
-    db.get(query, (err, row) => {
-        if (err) {
-            console.error('Database error:', err);
-            res.status(500).json({ 
-                success: false, 
-                message: 'Database error occurred',
-                error: err.message 
-            });
-            return;
-        }
-        
-        if (row) {
-            res.json({ 
-                success: true, 
-                message: 'Login successful!', 
-                user: { id: row.id, username: row.username }
-            });
-        } else {
-            res.json({ 
-                success: false, 
-                message: 'Invalid credentials' 
-            });
-        }
-    });
+
+    // Input validation – allow only alphanumeric usernames 3-30 chars
+    const usernamePattern = /^[a-zA-Z0-9_]{3,30}$/;
+    if (!usernamePattern.test(username) || typeof password !== 'string' || password.length < 8) {
+      return res.status(400).json({ error: 'Invalid username or password format.' });
+    }
+
+    // Hash the password with bcrypt
+    const saltRounds = 12;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+
+    // Parameterized query to prevent SQL injection
+    const [result] = await pool.execute(
+      'INSERT INTO users (username, password) VALUES (?, ?)',
+      [username, hashedPassword]
+    );
+
+    return res.status(201).json({ message: 'User registered successfully.', userId: result.insertId });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Internal server error.' });
+  }
 });
 
-// Get all users (for demonstration)
-app.get('/users', (req, res) => {
-    db.all("SELECT id, username FROM users", (err, rows) => {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-        }
-        res.json(rows);
-    });
+// Login endpoint – compares hashed passwords securely
+app.post('/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    // Input validation
+    const usernamePattern = /^[a-zA-Z0-9_]{3,30}$/;
+    if (!usernamePattern.test(username) || typeof password !== 'string') {
+      return res.status(400).json({ error: 'Invalid username or password format.' });
+    }
+
+    // Retrieve the user by username – parameterized query
+    const [rows] = await pool.execute(
+      'SELECT id, password FROM users WHERE username = ?',
+      [username]
+    );
+
+    if (rows.length === 0) {
+      return res.status(401).json({ error: 'Authentication failed.' });
+    }
+
+    const user = rows[0];
+    const passwordMatch = await bcrypt.compare(password, user.password);
+
+    if (!passwordMatch) {
+      return res.status(401).json({ error: 'Authentication failed.' });
+    }
+
+    // Issue JWT token
+    const token = jwt.sign(
+      { userId: user.id },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+
+    return res.json({ message: 'Login successful.', token });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Internal server error.' });
+  }
 });
 
-app.listen(port, () => {
-    console.log(`Vulnerable login demo running at http://localhost:${port}`);
-    console.log('');
-    console.log('🚨 WARNING: This application is intentionally vulnerable!');
-    console.log('For educational purposes only - DO NOT use in production!');
-    console.log('');
-    console.log('Try SQL injection with: \' OR 1=1--');
-    console.log('Or try: admin\' OR \'1\'=\'1\' --');
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
