@@ -1,90 +1,155 @@
+// server.js
+require('dotenv').config();
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
-const bodyParser = require('body-parser');
-const path = require('path');
+const session = require('express-session');
+const mysql = require('mysql2/promise');
+const bcrypt = require('bcrypt');
+const helmet = require('helmet');
+const { body, validationResult } = require('express-validator');
 
 const app = express();
-const port = 3001;
+app.use(helmet());
+app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 
-// Middleware
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json());
-app.use(express.static('public'));
+// Session configuration
+app.use(
+  session({
+    name: 'sid',
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: true,
+      maxAge: 1000 * 60 * 60 // 1 hour
+    }
+  })
+);
 
-// Initialize SQLite database
-const db = new sqlite3.Database(':memory:');
-
-// Create users table and insert sample data
-db.serialize(() => {
-    db.run(`CREATE TABLE users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT,
-        password TEXT
-    )`);
-    
-    // Insert sample users
-    db.run("INSERT INTO users (username, password) VALUES ('admin', 'secretpassword')");
-    db.run("INSERT INTO users (username, password) VALUES ('user1', 'password123')");
-    db.run("INSERT INTO users (username, password) VALUES ('testuser', 'mypassword')");
+// Create a reusable connection pool
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASS,
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
 });
 
-// Serve the login page
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
+// Registration endpoint with input validation and password hashing
+app.post(
+  '/register',
+  [
+    body('username').isAlphanumeric().isLength({ min: 4, max: 20 }),
+    body('password').isLength({ min: 8 })
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
 
-// VULNERABLE LOGIN ENDPOINT - DO NOT USE IN PRODUCTION!
-app.post('/login', (req, res) => {
     const { username, password } = req.body;
-    
-    // VULNERABLE SQL QUERY - Directly interpolating user input!
-    const query = `SELECT * FROM users WHERE username = '${username}' AND password = '${password}'`;
-    
-    console.log('Executing query:', query); // For demonstration purposes
-    
-    db.get(query, (err, row) => {
+    try {
+      const hashed = await bcrypt.hash(password, 12);
+      const [existing] = await pool.execute(
+        'SELECT id FROM users WHERE username = ?',
+        [username]
+      );
+      if (existing.length) {
+        return res.status(409).json({ message: 'Username already exists' });
+      }
+      await pool.execute(
+        'INSERT INTO users (username, password) VALUES (?, ?)',
+        [username, hashed]
+      );
+      res.status(201).json({ message: 'User registered successfully' });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: 'Internal server error' });
+    }
+  }
+);
+
+// Login endpoint with secure password verification
+app.post(
+  '/login',
+  [
+    body('username').isAlphanumeric(),
+    body('password').isString().isLength({ min: 8 })
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { username, password } = req.body;
+    try {
+      const [rows] = await pool.execute(
+        'SELECT id, password FROM users WHERE username = ?',
+        [username]
+      );
+      if (!rows.length) {
+        return res.status(401).json({ message: 'Invalid credentials' });
+      }
+      const user = rows[0];
+      const match = await bcrypt.compare(password, user.password);
+      if (!match) {
+        return res.status(401).json({ message: 'Invalid credentials' });
+      }
+      // Regenerate session to prevent fixation
+      req.session.regenerate(err => {
         if (err) {
-            console.error('Database error:', err);
-            res.status(500).json({ 
-                success: false, 
-                message: 'Database error occurred',
-                error: err.message 
-            });
-            return;
+          console.error(err);
+          return res.status(500).json({ message: 'Session error' });
         }
-        
-        if (row) {
-            res.json({ 
-                success: true, 
-                message: 'Login successful!', 
-                user: { id: row.id, username: row.username }
-            });
-        } else {
-            res.json({ 
-                success: false, 
-                message: 'Invalid credentials' 
-            });
-        }
-    });
+        req.session.userId = user.id;
+        res.json({ message: 'Logged in successfully' });
+      });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: 'Internal server error' });
+    }
+  }
+);
+
+// Middleware to protect routes
+function requireAuth(req, res, next) {
+  if (!req.session.userId) {
+    return res.status(401).json({ message: 'Unauthorized' });
+  }
+  next();
+}
+
+// Example protected data endpoint
+app.get('/data', requireAuth, async (req, res) => {
+  try {
+    const [rows] = await pool.execute(
+      'SELECT data FROM records WHERE user_id = ?',
+      [req.session.userId]
+    );
+    res.json({ records: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Internal server error' });
+  }
 });
 
-// Get all users (for demonstration)
-app.get('/users', (req, res) => {
-    db.all("SELECT id, username FROM users", (err, rows) => {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-        }
-        res.json(rows);
-    });
+// Logout endpoint
+app.post('/logout', requireAuth, (req, res) => {
+  req.session.destroy(err => {
+    if (err) {
+      console.error(err);
+      return res.status(500).json({ message: 'Logout failed' });
+    }
+    res.clearCookie('sid');
+    res.json({ message: 'Logged out' });
+  });
 });
 
-app.listen(port, () => {
-    console.log(`Vulnerable login demo running at http://localhost:${port}`);
-    console.log('');
-    console.log('🚨 WARNING: This application is intentionally vulnerable!');
-    console.log('For educational purposes only - DO NOT use in production!');
-    console.log('');
-    console.log('Try SQL injection with: \' OR 1=1--');
-    console.log('Or try: admin\' OR \'1\'=\'1\' --');
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
